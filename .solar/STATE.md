@@ -66,7 +66,7 @@ ThunderLLAMA 持续优化:
 |---|---------|---------|------|
 | A1 | Fused Expert Aggregation (7xADD -> 1 kernel) | +7.3% TG (实测) | 已完成 |
 | A2 | Q5_K Branchless Dequant | +2-5% TG | 待做 |
-| A3 | MoE ne21_mm_id_min 阈值降低 | +5-15% | 待做 |
+| A3 | MoE ne21_mm_id_min 阈值降低 | +1.7% TG (实测) | ✅ 已完成 |
 | A4 | Fused RMS_NORM+MUL+SWIGLU | +5-10% | 待做 |
 
 ## Tier B: 中等回报、技术挑战大
@@ -108,6 +108,7 @@ ThunderLLAMA 持续优化:
 - [2026-03-14] EXCLUSIVE 模式：禁用内置 prompt cache
 
 ## Metal 优化决策
+- [2026-03-15] **A3 MoE Threshold=16**：+1.7% TG (80.61 tok/s)。阈值 ≤8 灾难性下降 (-45%~-72%)
 - [2026-03-15] A1 验证：ADD 链融合已覆盖 MoE 聚合 (+7.3%)
 - [2026-03-15] K/V Projection Fusion：+9.8% TG, 输出 IDENTICAL
 - [2026-03-14] N_R0_Q5_K=8 编译时常量：7 组实测确认
@@ -141,12 +142,23 @@ ThunderLLAMA 持续优化:
 - LMCache 生产级升级: freq-protected LRU, TTL, warm API
 
 ## In-Progress
-- 无
+- Track 2: Q4_K 带宽 Profiling（MPS Phase 2 决策）
 
 ## Blocked
 - Normalization chain fusion (graph scheduler 限制)
 
 ## Done (新增 2026-03-15)
+
+### ✅ Tier A3: MoE 阈值优化（已完成）
+**优化**: ne21_mm_id_min 从 32 降低到 16
+**性能**: +1.7% TG (79.25 → 80.61 tok/s)
+**方法**: 快速扫描 (1/8/16/32)，发现阈值 ≤8 灾难性下降
+**代码**:
+- `ggml-metal-ops.cpp`: 环境变量支持 + 安全解析 (strtol)
+- `thunderllama.conf`: THUNDER_MOE_THRESHOLD=16
+**报告**: `.solar/moe-threshold-benchmark-20260315.md`
+
+## Done (2026-03-15 早期)
 ### 🚨 8.4% 性能回退调查（已解决）
 **问题**: Q4_K TG 79.12 → 72.51 tok/s (-8.4%)
 **根因**: llama-bench 测试时缺少 METAL_FUSION=1 环境变量，导致 MoE Kernel Fusion 被禁用
@@ -160,6 +172,6 @@ ThunderLLAMA 持续优化:
 - 直接用 llama-bench 需手动设置环境变量
 
 # Next Actions
-1. **决策 MPS Phase 2 方向** — Q5_K Split-K 还是转向 Tier A 优化 (A2/A3/A4)
-2. **分析 Q5_K 带宽瓶颈** — 如果选择继续 Split-K，需先 profiling
-3. **提交 MPS Phase 1 代码** — 固化成果（6 个文件未提交）
+1. **提交 Tier A3 代码** — 固化成果（ggml-metal-ops.cpp + thunderllama.conf + 测试报告）
+2. **Track 2: Q4_K 带宽 Profiling** — 验证 BW util 假设，决定是否继续 Split-K
+3. **基于 profiling 结果决策** — 继续 Split-K 或转向 Tier A (A2/A4)

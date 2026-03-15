@@ -2424,7 +2424,20 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     // ne20 = n_used_experts
     // ne21 = n_rows (batch size)
-    const int ne21_mm_id_min = 32;
+    // THUNDER_MOE_THRESHOLD: configurable via environment variable (for benchmarking)
+    // Default: 32 (optimized for batched workloads)
+    // Lower values (e.g., 1-16) may improve decode performance (BS=1) on some models
+    const char* threshold_env = getenv("THUNDER_MOE_THRESHOLD");
+    int ne21_mm_id_min = 32; // Default value
+    if (threshold_env) {
+        char* end;
+        long value = strtol(threshold_env, &end, 10);
+        // Validate: must be valid integer and positive
+        if (*end == '\0' && value > 0 && value <= 1024) {
+            ne21_mm_id_min = (int)value;
+        }
+        // Invalid values are silently ignored, default is used
+    }
 
     if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
         // some Metal matrix data types require aligned pointers
