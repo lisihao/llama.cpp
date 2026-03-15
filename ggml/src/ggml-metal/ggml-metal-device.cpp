@@ -869,6 +869,56 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_splitk(ggml_metal_library_t lib, const ggml_tensor * op, int nsg_k) {
+    char base[256];
+    char name[256];
+
+    int nsg = 0;  // total simdgroups = original NSG * nsg_k
+    int nr0 = 0;
+    int nr1 = 1;
+    size_t smem = 0;
+
+    const ggml_type tsrc0 = op->src[0]->type;
+    const ggml_type tsrc1 = op->src[1]->type;
+
+    switch (tsrc0) {
+        case GGML_TYPE_Q4_0:
+            {
+                nsg = N_SG_Q4_0 * nsg_k;   // e.g. 2*4=8
+                nr0 = N_R0_Q4_0;            // 4
+                // shared memory: NSG * NR0 floats for K-split reduction
+                smem = nsg * nr0 * sizeof(float);
+            } break;
+        default:
+            {
+                GGML_LOG_ERROR("Split-K not implemented for type %d\n", (int) tsrc0);
+                GGML_ABORT("not implemented");
+            }
+    };
+
+    snprintf(base, 256, "kernel_mul_mv_%s_%s_splitk", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    snprintf(name, 256, "%s_nsg=%d_nsgk=%d", base, nsg, nsg_k);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, nsg,   FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, nsg_k, FC_MUL_MV + 2);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = nr0;
+    res.nr1  = nr1;
+    res.nsg  = nsg;
+    res.smem = smem;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
     char base[256];
     char name[256];

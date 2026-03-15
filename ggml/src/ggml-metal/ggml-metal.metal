@@ -3230,8 +3230,9 @@ static inline void helper_mv_reduce_and_write(
     }
 }
 
-constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
-constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+constant short FC_mul_mv_nsg        [[function_constant(FC_MUL_MV + 0)]];
+constant short FC_mul_mv_nxpsg      [[function_constant(FC_MUL_MV + 1)]];
+constant short FC_mul_mv_splitk_nsgk [[function_constant(FC_MUL_MV + 2)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -3331,6 +3332,136 @@ kernel void kernel_mul_mv_q4_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// Split-K GEMV: splits K dimension across multiple simdgroups within a threadgroup
+// for better memory bandwidth utilization (target: 50% → 70-80% BW util)
+//
+// Architecture:
+//   NSG total simdgroups = NSG_K (K-parallel) * NSG_R (row-parallel)
+//   Each group of NSG_K simdgroups processes the same NR0 rows but different K ranges
+//   Final reduction via threadgroup shared memory
+//
+template<typename block_q_type, short NR0, typename args_t>
+void mul_vec_q_n_f32_splitk_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG   = FC_mul_mv_nsg;            // total simdgroups (e.g. 8)
+    const short NSG_K = FC_mul_mv_splitk_nsgk;    // K-parallel simdgroups (e.g. 4)
+    const short NSG_R = NSG / NSG_K;              // row-parallel simdgroups (e.g. 2)
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 16;
+
+    const int nb = args.ne00/QK4_0;
+
+    const short sg_k = sgitg % NSG_K;   // K split index (0..NSG_K-1)
+    const short sg_r = sgitg / NSG_K;   // row group index (0..NSG_R-1)
+
+    const int r0 = (tgpig.x * NSG_R + sg_r) * NR0;
+    const int r1 =  tgpig.y;
+    const int im =  tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    // pointers to src0 rows
+    device const block_q_type * ax[NR0];
+    FOR_UNROLL (int row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        ax[row] = (device const block_q_type *) ((device char *) src0 + offset0);
+    }
+
+    // Split K dimension: divide loop iterations among NSG_K simdgroups
+    const int total_iters  = (nb + NQ - 1) / NQ;
+    const int iters_per_k  = (total_iters + NSG_K - 1) / NSG_K;
+    const int iter_start   = sg_k * iters_per_k;
+    const int iter_end     = min((int)((sg_k + 1) * iters_per_k), total_iters);
+
+    float sumf[NR0] = {0.f};
+
+    const short ix = (tiisg/(NW/NQ));
+    const short il = (tiisg%(NW/NQ))*8;
+
+    const int ib0 = ix;
+
+    // start y pointer at the right K offset for this split
+    device const float * yb = y + (ib0 + iter_start * NQ) * QK4_0 + il;
+
+    float yl[16]; // src1 vector cache
+
+    for (int iter = iter_start; iter < iter_end; ++iter) {
+        const int ib = ib0 + iter * NQ;
+        if (ib >= nb) break;
+
+        float sumy[2] = { 0.f, 0.f };
+
+        FOR_UNROLL (short i = 0; i < 8; i += 2) {
+            sumy[0]  += yb[i +  0] + yb[i +  1];
+            yl[i + 0] = yb[i +  0];
+            yl[i + 1] = yb[i +  1]/256.f;
+
+            sumy[1]  += yb[i + 16] + yb[i + 17];
+            yl[i + 8] = yb[i + 16]/16.f;
+            yl[i + 9] = yb[i + 17]/4096.f;
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
+        }
+
+        yb += QK4_0 * NQ;
+    }
+
+    // Reduction via shared memory
+    // Layout: shmem_f[(sg_k * NSG_R + sg_r) * NR0 + row]
+    threadgroup float * shmem_f = (threadgroup float *) shmem;
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            shmem_f[(sg_k * NSG_R + sg_r) * NR0 + row] = tot;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // First K-split simdgroup reduces across K splits and writes output
+    if (sg_k == 0) {
+        device float * dst_f32 = (device float *) dst + im*args.ne0*args.ne1 + r1*args.ne0;
+
+        for (int row = 0; row < NR0; ++row) {
+            if (tiisg == 0 && r0 + row < args.ne01) {
+                float total = 0;
+                for (short k = 0; k < NSG_K; ++k) {
+                    total += shmem_f[(k * NSG_R + sg_r) * NR0 + row];
+                }
+                dst_f32[r0 + row] = total;
+            }
+        }
+    }
+}
+
+kernel void kernel_mul_mv_q4_0_f32_splitk(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_vec_q_n_f32_splitk_impl<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_q4_1_f32(

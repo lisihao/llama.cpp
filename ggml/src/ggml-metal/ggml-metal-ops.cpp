@@ -2267,6 +2267,56 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + 31)/32), ((ne01 + 63)/64), ne12*ne13, 128, 1, 1);
+    } else if (ggml_metal_mps_enabled() && ne11 == 1 &&
+               op->src[0]->type == GGML_TYPE_Q4_0) {
+        // [存疑] Split-K GEMV: K 维度拆分到多个 simdgroup 并行
+        // Q4_0 实测: -0.2% (74.29→74.12 tok/s), BW util 已达 ~79%
+        // 保留代码: USE_MPS_GRAPH=0 时走 baseline, =1 时走此路径
+        const int nsg_k = 4; // K-parallel simdgroups (tunable: 2, 4, 8)
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_splitk(lib, op, nsg_k);
+
+        const int nr0  = pipeline.nr0;
+        const int nr1  = pipeline.nr1;
+        const int nsg  = pipeline.nsg;
+        const int nsg_r = nsg / nsg_k;  // row-parallel simdgroups
+
+        ggml_metal_kargs_mul_mv args = {
+            /*.ne00 =*/ ne00,
+            /*.ne01 =*/ ne01,
+            /*.ne02 =*/ ne02,
+            /*.nb00 =*/ nb00,
+            /*.nb01 =*/ nb01,
+            /*.nb02 =*/ nb02,
+            /*.nb03 =*/ nb03,
+            /*.ne10 =*/ ne10,
+            /*.ne11 =*/ ne11,
+            /*.ne12 =*/ ne12,
+            /*.nb10 =*/ nb10,
+            /*.nb11 =*/ nb11,
+            /*.nb12 =*/ nb12,
+            /*.nb13 =*/ nb13,
+            /*.ne0  =*/ ne0,
+            /*.ne1  =*/ ne1,
+            /*.nr0  =*/ nr0,
+            /*.r2   =*/ r2,
+            /*.r3   =*/ r3,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+        // threadgroups: X = ceil(ne01 / (nr0 * nsg_r)), Y = 1 (BS=1), Z = batches
+        ggml_metal_encoder_dispatch_threadgroups(enc,
+            ((ne01 + nr0*nsg_r - 1)/(nr0*nsg_r)),
+            ((ne11 + nr1 - 1)/nr1),
+            ne12*ne13,
+            32, nsg, 1);
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
 

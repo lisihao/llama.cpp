@@ -23,23 +23,27 @@ ThunderLLAMA 持续优化:
 - thunderllama.conf USE_MPS_GRAPH 配置项
 - 编译验证：0 errors, 0 warnings
 
-### Phase 2: Split-K Decode GEMV (IN PROGRESS)
+### Phase 2: Split-K Decode GEMV — Q4_0 PoC NO-GO
 
 **关键发现**：
 - MPSGraph **没有** `quantizedMatmul` API（那是 MLX 的）
 - MLX 使用自定义 Metal kernel (STEEL GEMM)，不是 MPSGraph
 - 方案A（dequant→MPS matmul）因 Prefill 已被 LMCache 缓存而淘汰
-- **选定方案B**：Split-K fused kernel 优化 decode GEMV
+- **方案B (Split-K fused kernel)**：Q4_0 PoC 已实现，**No-Go**
 
-**带宽分析**：
-- 现有 kernel `kernel_mul_mv_q5_K_f32` 只有 4 路 K 并行
-- 带宽利用率仅 ~50-55% (65-72 tok/s vs 理论 132 tok/s)
-- Split-K 目标：16-32 路 K 并行 → 70-80% 带宽利用率
+**Q4_0 Split-K PoC 结果 (2026-03-15)**：
+| Config | Q4_0 TG (tok/s) | Delta |
+|--------|-----------------|-------|
+| Baseline (USE_MPS_GRAPH=0) | 73.26 ± 0.55 | — |
+| Split-K NSG_K=4 | 72.50 ± 0.41 | **-1.0%** |
 
-**计划**：
-1. Day 1: Q4_0 Split-K PoC → benchmark (Go/No-Go gate)
-2. Day 2: Q5_K Split-K → benchmark
-3. Day 3: 调优 + 集成
+**根因分析**：
+- Q4_0 带宽利用率已达 ~77%，留给 Split-K 的空间有限
+- Intra-TG Split-K 不增加总内存并行度：Original 16 TG/core × 2 SG = 32 SG ≈ Split-K 4 TG/core × 8 SG = 32 SG
+- Shared memory barrier + reduction 开销抵消了微弱的收益
+- 结论：Q4_0 kernel 已接近带宽上限，intra-TG Split-K 无法突破
+
+**待决策**：是否继续 Q5_K Split-K（BW util ~53%，可能有更大空间），或转向其他优化方向
 
 ---
 
@@ -68,7 +72,7 @@ ThunderLLAMA 持续优化:
 ## Tier B: 中等回报、技术挑战大
 | # | 优化方案 | 预估提升 | 状态 |
 |---|---------|---------|------|
-| B1 | **Split-K Quantized GEMV** | **+25-45% TG** | **Phase 2 进行中** |
+| B1 | **Split-K Quantized GEMV** | **+25-45% TG** | **Q4_0 No-Go (-1.0%), 待决策** |
 | B2 | MoE Expert-Only Dispatch | +5-15% | 待做 |
 | B3 | MoE map0 Barrier 消除 | +3-8% | 待做 |
 
@@ -96,6 +100,7 @@ ThunderLLAMA 持续优化:
 - [2026-03-15] **Phase 2 选定方案B (Split-K fused kernel)**：不重写 dequant 逻辑，核心改动是将 K 维度拆分到多个 threadgroup
 - [2026-03-15] **MPSGraph 没有 quantizedMatmul**：原计划假设错误。该 API 属于 MLX，不属于 Apple MPSGraph
 - [2026-03-15] **带宽分析**：现有 kernel 4 路 K 并行，带宽利用率仅 50-55%，理论空间大
+- [2026-03-15] **Split-K Q4_0 PoC No-Go**：-1.0% TG (73.26→72.50)。根因：Q4_0 BW util 已达 ~77%，intra-TG Split-K 不增加总内存并行度 (32 SG/core 不变)
 
 ## LMCache 架构决策
 - [2026-03-15] 移除 L1 GPU Pool：slot 管理清空 KV cache 导致缓存失效
@@ -136,13 +141,25 @@ ThunderLLAMA 持续优化:
 - LMCache 生产级升级: freq-protected LRU, TTL, warm API
 
 ## In-Progress
-- **#1 MPS 集成 Phase 2**: Split-K decode GEMV 实现
+- 无
 
 ## Blocked
 - Normalization chain fusion (graph scheduler 限制)
 
+## Done (新增 2026-03-15)
+### 🚨 8.4% 性能回退调查（已解决）
+**问题**: Q4_K TG 79.12 → 72.51 tok/s (-8.4%)
+**根因**: llama-bench 测试时缺少 METAL_FUSION=1 环境变量，导致 MoE Kernel Fusion 被禁用
+**验证**:
+- 加上 METAL_FUSION=1: 79.81 ± 0.15 tok/s (恢复正常)
+- 稳定性测试 3-run: 79.64/79.54/79.76 tok/s
+**解决方案**:
+- thunderllama.conf 中 METAL_FUSION=1 已设置（line 103）
+- config-parser.h 正确映射到 GGML_METAL_FUSION_DISABLE
+- 使用 llama-server 或启动脚本会自动读取配置
+- 直接用 llama-bench 需手动设置环境变量
+
 # Next Actions
-1. **Split-K Q4_0 PoC** — 最简单格式验证 Split-K 有效性
-2. **Split-K Q5_K** — 移植到主力量化格式
-3. **调优 + 集成** — split factor, threadgroup size 调参
-4. **Benchmark** — 5-run TG 对比 (目标 >= 85 tok/s)
+1. **决策 MPS Phase 2 方向** — Q5_K Split-K 还是转向 Tier A 优化 (A2/A3/A4)
+2. **分析 Q5_K 带宽瓶颈** — 如果选择继续 Split-K，需先 profiling
+3. **提交 MPS Phase 1 代码** — 固化成果（6 个文件未提交）
