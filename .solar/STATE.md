@@ -23,7 +23,7 @@ ThunderLLAMA 持续优化:
 - thunderllama.conf USE_MPS_GRAPH 配置项
 - 编译验证：0 errors, 0 warnings
 
-### Phase 2: Split-K Decode GEMV — Q4_0 PoC NO-GO
+### Phase 2: Split-K Decode GEMV — 已放弃，转向 Tier A4
 
 **关键发现**：
 - MPSGraph **没有** `quantizedMatmul` API（那是 MLX 的）
@@ -37,13 +37,18 @@ ThunderLLAMA 持续优化:
 | Baseline (USE_MPS_GRAPH=0) | 73.26 ± 0.55 | — |
 | Split-K NSG_K=4 | 72.50 ± 0.41 | **-1.0%** |
 
-**根因分析**：
-- Q4_0 带宽利用率已达 ~77%，留给 Split-K 的空间有限
-- Intra-TG Split-K 不增加总内存并行度：Original 16 TG/core × 2 SG = 32 SG ≈ Split-K 4 TG/core × 8 SG = 32 SG
-- Shared memory barrier + reduction 开销抵消了微弱的收益
-- 结论：Q4_0 kernel 已接近带宽上限，intra-TG Split-K 无法突破
+**Q4_K 带宽分析 (2026-03-15)**：
+- 理论估算：150.2% 带宽利用率（超出物理极限，说明计算有误差）
+- 与 Q4_0 实测对比：Q4_0 ~77% BW util → Split-K 失败
+- Q4_K 与 Q4_0 block 格式相同 (176 bytes/256 elements)
+- **结论**：Q4_K 预期结果与 Q4_0 一致，Split-K 不可行
 
-**待决策**：是否继续 Q5_K Split-K（BW util ~53%，可能有更大空间），或转向其他优化方向
+**根因分析**：
+- Intra-TG Split-K 不增加总内存并行度：32 SG/core 不变
+- Shared memory barrier + reduction 开销抵消收益
+- 结论：量化 kernel 已接近带宽上限，Split-K 方向不可行
+
+**最终决策 (2026-03-15)**：放弃 Split-K，转向 Tier A4 (Fused MatMul + SWIGLU)
 
 ---
 
@@ -67,12 +72,12 @@ ThunderLLAMA 持续优化:
 | A1 | Fused Expert Aggregation (7xADD -> 1 kernel) | +7.3% TG (实测) | 已完成 |
 | A2 | Q5_K Branchless Dequant | +2-5% TG | 待做 |
 | A3 | MoE ne21_mm_id_min 阈值降低 | +1.7% TG (实测) | ✅ 已完成 |
-| A4 | Fused RMS_NORM+MUL+SWIGLU | +5-10% | 待做 |
+| A4 | Fused MatMul+SWIGLU (方案调整) | +5-10% TG | 🔄 进行中 |
 
 ## Tier B: 中等回报、技术挑战大
 | # | 优化方案 | 预估提升 | 状态 |
 |---|---------|---------|------|
-| B1 | **Split-K Quantized GEMV** | **+25-45% TG** | **Q4_0 No-Go (-1.0%), 待决策** |
+| B1 | **Split-K Quantized GEMV** | **+25-45% TG** | **❌ 已放弃 (Q4_0/Q4_K 均失败)** |
 | B2 | MoE Expert-Only Dispatch | +5-15% | 待做 |
 | B3 | MoE map0 Barrier 消除 | +3-8% | 待做 |
 
@@ -80,7 +85,7 @@ ThunderLLAMA 持续优化:
 
 ## 独立任务
 - [x] **#1 MPS 集成 Phase 1** -- MPS 基础设施 + FP16 GEMM PoC
-- [ ] **#1 MPS 集成 Phase 2** -- Split-K decode GEMV 优化
+- [x] **#1 MPS 集成 Phase 2** -- Split-K 方向研究完成，已放弃
 - [ ] **#2 Paged Attention 优化** -- 对标 vllm-mlx
 - [x] **#9 LRU 策略优化** -- LMCache 生产级升级
 
@@ -109,6 +114,8 @@ ThunderLLAMA 持续优化:
 
 ## Metal 优化决策
 - [2026-03-15] **A3 MoE Threshold=16**：+1.7% TG (80.61 tok/s)。阈值 ≤8 灾难性下降 (-45%~-72%)
+- [2026-03-15] **A4 方向调整：Fused MatMul + SWIGLU**：原计划三合一融合 (RMS_NORM+MUL+SWIGLU) 风险高。专家会审（稳健派+探索派）一致推荐 Two-Stage Fusion：RMS_Norm 独立，MatMul+SWIGLU 融合。理由：(1) RMS_Norm 的 threadgroup_barrier 会降低性能 (2) MatMul+SWIGLU 融合节省中间 tensor 全局内存读写 (3) 业界验证（MLX/llama.cpp 均采用此模式）
+- [2026-03-15] **Split-K 方向最终放弃**：Q4_K 带宽分析显示理论利用率 >100%（计算有误差但指向高带宽），结合 Q4_0 PoC 失败 (-1.0%)，确认 intra-TG Split-K 不增加内存并行度。转向 Tier A4
 - [2026-03-15] A1 验证：ADD 链融合已覆盖 MoE 聚合 (+7.3%)
 - [2026-03-15] K/V Projection Fusion：+9.8% TG, 输出 IDENTICAL
 - [2026-03-14] N_R0_Q5_K=8 编译时常量：7 组实测确认
@@ -147,7 +154,21 @@ ThunderLLAMA 持续优化:
 ## Blocked
 - Normalization chain fusion (graph scheduler 限制)
 
-## Done (新增 2026-03-15)
+## Done (2026-03-15 晚)
+
+### ✅ Track 2: Q4_K 带宽 Profiling（已完成）
+**任务**: 验证 Q4_K 带宽利用率，决定 Split-K 方向
+**方法**: 理论带宽估算 + 专家会审
+**结果**:
+- 理论估算：150.2% BW util（超出物理极限）
+- 稳健派分析：当前 SWIGLU kernel 瓶颈是内存带宽
+- 探索派调研：MLX/llama.cpp 均不融合 RMS_Norm + MatMul
+- **决策**: 放弃 Split-K，转向 Fused MatMul + SWIGLU
+**输出**:
+- `scripts/estimate-bandwidth-util.py` - 带宽估算工具
+- `scripts/profile-q4k-bandwidth.sh` - Instruments profiling 指南
+
+## Done (新增 2026-03-15 早)
 
 ### ✅ Tier A3: MoE 阈值优化（已完成）
 **优化**: ne21_mm_id_min 从 32 降低到 16
@@ -172,6 +193,12 @@ ThunderLLAMA 持续优化:
 - 直接用 llama-bench 需手动设置环境变量
 
 # Next Actions
-1. **提交 Tier A3 代码** — 固化成果（ggml-metal-ops.cpp + thunderllama.conf + 测试报告）
-2. **Track 2: Q4_K 带宽 Profiling** — 验证 BW util 假设，决定是否继续 Split-K
-3. **基于 profiling 结果决策** — 继续 Split-K 或转向 Tier A (A2/A4)
+1. **提交性能基线** — 打标签记录当前性能 (Q4_K_M: 79-80 tok/s)
+2. **实施 Tier A4: Fused MatMul + SWIGLU** — 预期 +5-10% TG
+   - 实现路径（5 步）:
+     1. 定义新 Op: GGML_OP_MUL_MAT_SILU
+     2. 添加 dispatch 逻辑（ggml-metal-ops.cpp）
+     3. 创建融合 kernel（复制 kernel_mul_mat_p_f32 + 内联 SiLU）
+     4. 修改计算图（替换 MatMul + SiLU 序列）
+     5. 验证正确性（bit-identical 测试）
+3. **性能验证** — 对比融合前后 TG，确认 +5-10% 提升
