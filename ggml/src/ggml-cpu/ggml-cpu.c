@@ -1506,6 +1506,31 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// Tier A4: Fused MatMul + SiLU
+static void ggml_compute_forward_mul_mat_silu(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    // Step 1: Compute matmul (reuse existing mul_mat implementation)
+    ggml_compute_forward_mul_mat(params, dst);
+
+    // Step 2: Apply SiLU activation in-place on result
+    const int64_t ne = ggml_nelements(dst);
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Divide work among threads
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ie_start = dr * ith;
+    const int64_t ie_end = MIN(ie_start + dr, ne);
+
+    float * dst_data = (float *) dst->data;
+    for (int64_t i = ie_start; i < ie_end; i++) {
+        const float x = dst_data[i];
+        dst_data[i] = x / (1.0f + expf(-x));
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1807,6 +1832,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_L2_NORM:
             {
                 ggml_compute_forward_l2_norm(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_SILU:
+            {
+                ggml_compute_forward_mul_mat_silu(params, tensor);
             } break;
         case GGML_OP_MUL_MAT:
             {
@@ -2281,6 +2310,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_SILU:  // Tier A4: Fused MatMul + SiLU
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;

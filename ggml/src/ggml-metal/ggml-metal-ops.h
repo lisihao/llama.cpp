@@ -66,6 +66,7 @@ int ggml_metal_op_pool_1d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pool_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mul_mat_silu      (ggml_metal_op_t ctx, int idx);  // Tier A4: Fused MatMul + SiLU
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);

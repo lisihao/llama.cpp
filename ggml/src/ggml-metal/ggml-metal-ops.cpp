@@ -376,6 +376,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_mul_mat_id(ctx, idx);
             } break;
+        case GGML_OP_MUL_MAT_SILU:
+            {
+                // Tier A4: Fused MatMul + SiLU activation
+                n_fuse = ggml_metal_op_mul_mat_silu(ctx, idx);
+            } break;
         case GGML_OP_GET_ROWS:
             {
                 n_fuse = ggml_metal_op_get_rows(ctx, idx);
@@ -2584,6 +2589,60 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    return 1;
+}
+
+// Tier A4: Fused MatMul + SiLU activation
+int ggml_metal_op_mul_mat_silu(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_encoder_t enc_before = ctx->enc;
+    GGML_LOG_INFO("MUL_MAT_SILU: encoder before matmul = %p\n", enc_before);
+
+    // Step 1: Execute matmul using existing kernel
+    int n_fuse = ggml_metal_op_mul_mat(ctx, idx);
+    if (n_fuse != 1) {
+        // matmul failed or fused multiple ops, skip SiLU
+        return n_fuse;
+    }
+
+    // Insert memory barrier to ensure matmul completes before SiLU starts
+    ggml_metal_encoder_memory_barrier(ctx->enc);
+    GGML_LOG_INFO("MUL_MAT_SILU: memory barrier inserted\n");
+
+    // Step 2: Apply SiLU in-place to the result
+    ggml_tensor * op = ctx->node(idx);
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_library_t lib = ctx->lib;
+
+    GGML_LOG_INFO("MUL_MAT_SILU: encoder after matmul = %p (same = %d)\n", enc, enc == enc_before);
+
+    int64_t ne = ggml_nelements(op);
+    ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+
+    GGML_LOG_INFO("MUL_MAT_SILU: applying SiLU in-place to %lld elements, buffer = %p, offset = %zu\n",
+                  ne, bid_dst.metal, bid_dst.offs);
+
+    // Dispatch SiLU in-place kernel (compile on-demand if needed)
+    const char * kernel_name = "kernel_silu_inplace_f32";
+    auto pipeline = ggml_metal_library_get_pipeline(lib, kernel_name);
+    if (!pipeline.pipeline) {
+        GGML_LOG_INFO("MUL_MAT_SILU: compiling SiLU kernel on first use\n");
+        pipeline = ggml_metal_library_compile_pipeline(lib, kernel_name, kernel_name, nullptr);
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_buffer(enc, bid_dst, 0);
+    ggml_metal_encoder_set_bytes(enc, (void *)&ne, sizeof(int64_t), 1);
+
+    // Dispatch with 256 threads per threadgroup (safer than 512)
+    const int64_t nth = 256;
+    const int64_t num_tg = (ne + nth - 1) / nth;
+    ggml_metal_encoder_dispatch_threadgroups(enc, num_tg, 1, 1, nth, 1, 1);
+
+    GGML_LOG_INFO("MUL_MAT_SILU: dispatched %lld threadgroups x %lld threads\n", num_tg, nth);
+
+    GGML_LOG_INFO("MUL_MAT_SILU: SiLU kernel dispatched\n");
+
+    // Return 1 because we processed 1 graph node (MUL_MAT_SILU), even though it's fused internally
     return 1;
 }
 

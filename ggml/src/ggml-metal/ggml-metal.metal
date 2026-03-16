@@ -1383,14 +1383,50 @@ kernel void kernel_swiglu_f32(
     device const float * src1_row = (device const float *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
     device       float * dst_row  = (device       float *) ((device       char *) dst  + tgpig*args.nb1);
 
-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
-        const float x0 = src0_row[i0];
-        const float x1 = src1_row[i0];
+    // Tier A4: Vectorized SWIGLU optimization
+    // Process 4 elements at a time for better memory bandwidth utilization
+    const int ne0_vec4 = args.ne0 / 4;
+    const int ne0_rem  = args.ne0 % 4;
 
-        const float silu = x0 / (1.0f + exp(-x0));
+    device const float4 * src0_vec4 = (device const float4 *) src0_row;
+    device const float4 * src1_vec4 = (device const float4 *) src1_row;
+    device       float4 * dst_vec4  = (device       float4 *) dst_row;
 
-        dst_row[i0] = silu*x1;
+    // Vectorized loop: process 4 floats per iteration
+    for (int i0 = tpitg; i0 < ne0_vec4; i0 += ntg) {
+        const float4 x0 = src0_vec4[i0];
+        const float4 x1 = src1_vec4[i0];
+
+        // SiLU: x / (1 + exp(-x)) - use precise::exp for correctness
+        const float4 silu = x0 / (1.0f + precise::exp(-x0));
+
+        dst_vec4[i0] = silu * x1;
     }
+
+    // Handle remaining elements (< 4)
+    if (tpitg == 0 && ne0_rem > 0) {
+        const int base = ne0_vec4 * 4;
+        for (int i0 = 0; i0 < ne0_rem; i0++) {
+            const float x0 = src0_row[base + i0];
+            const float x1 = src1_row[base + i0];
+            const float silu = x0 / (1.0f + precise::exp(-x0));
+            dst_row[base + i0] = silu * x1;
+        }
+    }
+}
+
+// Tier A4: SiLU in-place activation for MUL_MAT_SILU fusion
+kernel void kernel_silu_inplace_f32(
+        device float * data [[buffer(0)]],
+        constant int64_t & ne [[buffer(1)]],
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    const int64_t i = tgpig * ntg + tpitg;
+    if (i >= ne) return;
+
+    const float x = data[i];
+    data[i] = x / (1.0f + precise::exp(-x));
 }
 
 kernel void kernel_swiglu_oai_f32(

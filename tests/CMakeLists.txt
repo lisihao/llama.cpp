@@ -308,3 +308,26 @@ target_link_libraries(test-kv-quantize-v2 PRIVATE ggml-metal)
 target_include_directories(test-kv-quantize-v2 PRIVATE
     ${PROJECT_SOURCE_DIR}/ggml/src
     ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+
+# ThunderLLAMA Tier A4: MUL_MAT_SILU 融合测试
+llama_build(test-mul-mat-silu.cpp)
+target_link_libraries(test-mul-mat-silu PRIVATE ggml)
+target_include_directories(test-mul-mat-silu PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src
+    ${PROJECT_SOURCE_DIR}/ggml/include)
+
+# ThunderLLAMA Tier A4: MUL_MAT_SILU Metal backend 测试
+llama_build(test-mul-mat-silu-metal.cpp)
+target_link_libraries(test-mul-mat-silu-metal PRIVATE ggml ggml-metal)
+target_include_directories(test-mul-mat-silu-metal PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal
+    ${PROJECT_SOURCE_DIR}/ggml/include)
+
+# ThunderLLAMA Tier A4: SWIGLU 向量化性能测试
+llama_build(test-swiglu-benchmark.cpp)
+target_link_libraries(test-swiglu-benchmark PRIVATE ggml ggml-metal)
+target_include_directories(test-swiglu-benchmark PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal
+    ${PROJECT_SOURCE_DIR}/ggml/include)

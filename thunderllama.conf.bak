@@ -6,9 +6,9 @@
 # ============================================================================
 # 模型配置
 # ============================================================================
-MODEL_PATH="$HOME/models/qwen3-30b-a3b-gguf/Qwen3-30B-A3B-128K-Q4_K_M.gguf"
+MODEL_PATH="/Users/lisihao/models/qwen3-30b-a3b-gguf/Qwen3-30B-A3B-128K-Q5_K_M.gguf"
 MODEL_TYPE="30B-Q4"
-CONTEXT_SIZE=4096
+CONTEXT_SIZE=16384
 
 # ============================================================================
 # ThunderLLAMA 特有优化（核心特性）
@@ -20,20 +20,7 @@ THUNDER_LMCACHE_DISK_PATH="/Volumes/toshiba/thunderllama-cache/kv_cache.bin"
 THUNDER_PREFIX_MATCHING=1
 THUNDER_LMCACHE_EXCLUSIVE=1  # 禁用内置 prompt cache，避免干扰 LMCache（测试用）
 
-# LMCache 容量配置（Task 9 新增）
-LMCACHE_L2_SIZE_GB=8                 # L2 CPU 内存缓存容量 (GB)，默认 8
-LMCACHE_L3_SIZE_GB=256               # L3 磁盘缓存容量 (GB)，默认 256
-
-# LMCache 驱逐策略配置（Task 9 新增）
-LMCACHE_FREQ_PROTECT=5              # 频率保护阈值: 访问次数 > 此值的 chunk 免于驱逐 (second chance)
-                                     # 被保护的 chunk 频率衰减 50%，移到 LRU 头部
-                                     # 设为 0 禁用频率保护（纯 LRU）
-
-# LMCache TTL 配置（Task 9 新增）
-LMCACHE_TTL_HOURS=0                  # chunk 最大存活时间 (小时)，0 = 无限（默认）
-                                     # 过期 chunk 在 put() 时 lazy 驱逐
-
-# Paged Attention（有缺陷，禁止启用 - 监护人明确指示）
+# Paged Attention（禁用 - 未调试完成）
 LLAMA_PAGED_ATTENTION=0
 
 # Chunk Prefill（批量处理 prompt，启用 LMCache prefill skip）
@@ -45,19 +32,10 @@ THUNDERLLAMA_CHUNK_PREFILL=512
 # KV Cache 策略配置（通过 API 设置）
 # ============================================================================
 KV_CACHE_STRATEGY="fixed"        # 策略类型: fixed | threshold | adaptive
-KV_CACHE_LEVEL="q8_0"             # 量化级别: f16 | q8_0 | q4_0
-# 推荐: q8_0 - 平衡性能和内存（测试验证：仅损失2.2%性能，节省50%内存）
-# 实测 (Task #18, 15 tests):
-#   f16:  TG=46.55 PP=86.12, KV=1536MB (baseline)
-#   q8_0: TG=45.51 PP=84.20, KV=768MB  (-2.2%, -50% memory) <-- 推荐
-#   q4_0: TG=43.70 PP=80.85, KV=384MB  (-6.1%, -75% memory)
-# 短上下文使用 f16 也可（反量化开销 < 带宽节省的平衡点约 4096 tokens）
-#
-# 动态量化（已废弃 - 2026-03-15）
-# - 原计划: #11 在 update() 中调用 Metal kernel 实现运行时量化
-# - 废弃原因: 静态量化（创建时指定类型）已满足需求，动态量化带来额外性能开销
-# - 保留代码: llama-kv-cache.cpp:860-886 占位代码保留（-1.8% 影响可接受）
-# - 推荐方案: 使用静态量化（修改 KV_CACHE_LEVEL 后重启）
+KV_CACHE_LEVEL="q4_0"
+# 说明: Q4_K 模型 + f16 KV cache（最优组合）
+# Q4_K 模型: TG +19% (71.6 tok/s)
+# f16 KV: 避免反量化开销，LMCache 加载最快
 
 # ============================================================================
 # 服务器基础配置
@@ -98,45 +76,9 @@ METAL_MAX_BUFFER_SIZE=40000000000  # Metal 最大工作集 (40 GB)
 
 # Metal Kernel Fusion（编译时优化，运行时开关）
 # 包含: ADD 元素操作融合 + MoE Top-K Gating 融合
-# ⚠️ 重新测试结果 (2026-03-15, 正确参数 -t 4):
-#    - fusion=0: 80.01 tok/s
-#    - fusion=1: 79.87 tok/s
-#    - 效果: -0.17% (轻微负面影响，误差范围内)
-# 历史错误: 声称 +12.5% 是因为基线用了错误参数 -t 10
-METAL_FUSION=1                   # 1=启用（默认）, 对性能无显著影响
-
-# QKV Projection Fusion（✅ 已验证 - 2026-03-15）
-# K/V 权重融合（GQA 适配版）: wk + wv → wkv
-# 减少矩阵乘法次数: 2×MUL_MAT(wk,wv) → 1×MUL_MAT(wkv) + 2×SLICE
-# 条件: GQA模型 + 量化>=Q4_K + 非LoRA
-# 实测效果: Qwen3-30B Q4_K_M +3.0% TG (71.73 → 73.88 tok/s)
-# 适用: Qwen3-30B (48/48 layers), Qwen3.5-35B (10/40 layers)
-# ✅ 已验证稳定，推荐启用
-FUSED_QKV=1                      # 1=启用（推荐）, 0=禁用
-
-# --- MoE Dispatch 阈值优化（✅ 已验证 - 2026-03-15）---
-# 控制 MoE 使用 GEMM vs GEMV kernel 的切换点
-# ne21_mm_id_min: 当 batch size >= 此值时使用 GEMM，否则用 GEMV
-# 重新测试结果 (2026-03-15, 正确参数 -t 4):
-#   - threshold=32: 79.80 tok/s (默认)
-#   - threshold=16: 80.22 tok/s (优化)
-#   - 效果: +0.53% (小幅提升)
-# 历史声称: +1.7% (被夸大，可能是测试波动)
-# ⚠️ 警告: 阈值 ≤ 8 会导致灾难性性能下降 (-45% ~ -72%)
-THUNDER_MOE_THRESHOLD=16
-
-# MPS (Metal Performance Shaders) Integration
-# Phase 1: FP16 GEMM via MPSMatrixMultiplication
-#   - Replaces hand-written Metal kernel for FP16 matmul
-#   - Uses Apple's optimized MPSMatrixMultiplication
-#   - Only applies to: FP16 weights × FP32 input, 2D (non-batched)
-# Phase 2: Split-K Q4_0 GEMV (intra-TG K-splitting)
-#   - kernel_mul_mv_q4_0_f32_splitk: K 维度分给 4 个 simdgroup 并行
-#   - ⚠️ 存疑: Q4_0 实测 -0.2% (74.29→74.12 tok/s, 5-run, 干净内存)
-#   - 根因: Q4_0 BW 利用率已达 ~79%, intra-TG Split-K 不增加总内存并行度
-#   - 保留代码，未来 Q4_K/Q5_K 或 inter-TG 方案可能有用
-# ⚠️ 实验性功能，默认禁用
-USE_MPS_GRAPH=0                  # 0=禁用（默认，走 baseline kernel）, 1=启用（Split-K + MPS FP16）
+# 效果: Q5_K TG +10.5% (59→65), Q4_K TG +12.5% (70→79)
+# 设为 0 仅用于调试/排错
+METAL_FUSION=1                   # 1=启用（默认）, 0=禁用（调试用）
 
 # ============================================================================
 # 已验证无效的优化（不要使用！）
@@ -147,11 +89,6 @@ USE_MPS_GRAPH=0                  # 0=禁用（默认，走 baseline kernel）, 1
 #
 # ❌ N-gram Speculative Decoding: 质量下降，性能无提升
 #    原因: N-gram 预测对大模型帮助有限
-#
-# ❌ Q5_K Branchless Dequantization (Tier A2): 已不适用
-#    原因: 已切换到 Q4_K_M 模型（TG 79.12 tok/s，比 Q5_K 快 21%）
-#    废弃日期: 2026-03-15
-#    说明: 该优化仅针对 Q5_K，当前使用 Q4_K_M
 #
 # SPECULATIVE_DECODING=0  # 强制禁用
 # DRAFT_MODEL=""
@@ -201,22 +138,21 @@ GRAPH_REUSE=1                    # 1=启用（默认）
 # ============================================================================
 # 性能基准（作为参考）
 # ============================================================================
-# 当前配置预期性能（基于实测 2026-03-15, build 8408, 正确参数验证）:
+# 当前配置预期性能（基于实测 2026-03-15, build 8389+MoE fusion）:
 #
 # ┌─────────────────────────────────────────────────────────────────┐
-# │ Q4_K_M (17.28 GiB) — 当前使用模型                             │
-# │   TG128:  79.8-80.2 tok/s  (FA=1, t=4, 5-run)                │
-# │   PP512:  787-793 tok/s                                       │
-# │                                                                 │
-# │ 参数: -t 4 -fa 1 -ngl 99 -p 512 -n 128 -r 5                   │
-# │ 环境: METAL_FUSION=1 FUSED_QKV=1 THUNDER_MOE_THRESHOLD=16     │
+# │ Q5_K_M (20.23 GiB) — 默认模型                                │
+# │   TG128:  65.25 ± 0.16 tok/s  (FA=1, fusion=1, t=4, 10-run)  │
+# │   PP512:  729.47 ± 6.80 tok/s                                 │
+# ├─────────────────────────────────────────────────────────────────┤
+# │ Q4_K_M (17.28 GiB) — 速度优先                                │
+# │   TG128:  79.12 ± 0.20 tok/s  (FA=1, fusion=1, t=4, 5-run)   │
+# │   PP512:  787.50 ± 6.14 tok/s                                 │
 # └─────────────────────────────────────────────────────────────────┘
 #
-# ⚠️ 历史性能声称修正（2026-03-15 重新测试）:
-#   - MoE Fusion: 声称 +12.5% → 实测 -0.17% (基线参数错误)
-#   - MoE Threshold=16: 声称 +1.7% → 实测 +0.53%
-#   - SWIGLU 向量化: 实测 +0.06%
-#   真实基线性能主要来自正确参数 (-t 4) 而非算法优化
+# MoE Fusion 提速效果 (fusion=0 → fusion=1):
+#   Q5_K: 59.07 → 65.25 (+10.5%)
+#   Q4_K: 70.35 → 79.12 (+12.5%)
 #
 # 服务器场景 (LMCache):
 #   - 重复请求:       80-120 tok/s  (LMCache 缓存命中)
@@ -235,20 +171,6 @@ GRAPH_REUSE=1                    # 1=启用（默认）
 # ============================================================================
 # 更新历史
 # ============================================================================
-# 2026-03-15: 标记 Q5_K Branchless Dequantization 为废弃
-#   - 决策: 不再实现 Q5_K 优化（Tier A2）
-#   - 原因: 已切换到 Q4_K_M 模型（性能更优）
-#   - 数据: Q4_K TG=79.12 tok/s vs Q5_K TG=65.25 tok/s (+21%)
-#   - 结论: Q4_K_M 是最优选择，Q5_K 优化无价值
-#
-# 2026-03-15: 标记动态 KV Cache 量化为废弃
-#   - 决策: 动态量化（#11）价值有限，标记为废弃
-#   - 原因: 静态量化（创建时指定类型）已满足需求
-#   - 证据: Q8_0 节省 50% 内存，仅 -5.6% 性能，质量无损
-#   - 保留: llama-kv-cache.cpp 占位代码保留（-1.8% 影响可接受）
-#   - 推荐: 使用静态量化（修改 KV_CACHE_LEVEL 后重启）
-#   - 分析: /tmp/kv_quantization_analysis.md
-#
 # 2026-03-15: llama-server 字符串处理优化（HTTP 开销优化）
 #   - 优化 process_token 函数中的字符串处理
 #   - 修改文件: tools/server/server-context.cpp
@@ -266,7 +188,7 @@ GRAPH_REUSE=1                    # 1=启用（默认）
 #   - 正确性: 端到端测试输出一致
 #   - 结论: llama-server 开销从 29% 降低到 7%，已接近 llama-bench 性能
 #
-# 2026-03-15: Metal MoE Kernel Fusion（⚠️ 性能声称已修正）
+# 2026-03-15: Metal MoE Kernel Fusion（Tier 3 达成）
 #   - 新增 kernel_topk_moe_f32 Metal 内核
 #   - 融合 SOFT_MAX → ARGSORT → GET_ROWS 为 1 个 dispatch（原 3 个）
 #   - 每 MoE 层减少 2 dispatches，48 层共减少 96 dispatches
@@ -274,13 +196,11 @@ GRAPH_REUSE=1                    # 1=启用（默认）
 #              ggml-metal-device.cpp, ggml-metal-device.h, ggml-metal-ops.h
 #   - 算法: Simdgroup softmax → iterative top-8 argmax → weight normalization
 #   - 适用: n_expert ≤ 256 且为 2 的幂次（Qwen3 n_expert=128）
-#   - ❌ 历史错误实测 (基线参数 -t 10 错误):
-#     Q4_K_M: 无fusion=70.35 → 有fusion=79.12 (+12.5%) ← 错误！
-#   - ✅ 正确重新测试 (2026-03-15, -t 4):
-#     Q4_K_M: 无fusion=80.01 → 有fusion=79.87 (-0.17%)
-#     结论: MoE Fusion 对性能无显著影响（轻微负面，误差范围内）
+#   - 10-run 稳定实测:
+#     Q5_K_M: 无fusion=59.07 → 有fusion=65.25 (+10.5%)
+#     Q4_K_M: 无fusion=70.35 → 有fusion=79.12 (+12.5%)
 #   - 正确性: A/B 对比输出 byte-identical
-#   - 配置项: METAL_FUSION=1 (默认启用), 对性能无影响
+#   - 配置项: METAL_FUSION=1 (默认启用), =0 禁用调试
 #   - 注: Graph scheduler 将 MUL_MAT_ID 插在 GET_ROWS 和 SUM_ROWS 之间，
 #         导致 normalization chain (SUM_ROWS→CLAMP→DIV) 无法一起融合。
 #         当前实现只融合 gating 部分 (SOFT_MAX→ARGSORT→GET_ROWS)。

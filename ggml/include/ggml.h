@@ -502,6 +502,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_SILU,  // Fused MatMul + SiLU activation (Tier A4)
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1401,6 +1402,12 @@ extern "C" {
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
     GGML_API struct ggml_tensor * ggml_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // Fused MatMul + SiLU activation (Tier A4 optimization)
+    GGML_API struct ggml_tensor * ggml_mul_mat_silu(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
