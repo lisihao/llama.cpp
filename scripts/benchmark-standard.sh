@@ -15,9 +15,10 @@ MODEL="${MODEL:-$HOME/models/qwen3-30b-a3b-gguf/Qwen3-30B-A3B-128K-Q4_K_M.gguf}"
 # 标准环境变量（与 thunderllama.conf 一致）
 export METAL_FUSION=1
 export FUSED_QKV=1
-export USE_MPS_GRAPH=0          # 禁用 MPS Graph（已验证对性能有负面影响）
-export THUNDER_LMCACHE=0        # 禁用 LMCache（测试基线性能）
-export LLAMA_PAGED_ATTENTION=0  # 禁用 Paged Attention（测试基线性能）
+export THUNDER_MOE_THRESHOLD=16  # MoE 调度优化（已验证 +0.53%）
+export USE_MPS_GRAPH=0           # 禁用 MPS Graph（已验证对性能有负面影响）
+export THUNDER_LMCACHE=0         # 禁用 LMCache（测试基线性能）
+export LLAMA_PAGED_ATTENTION=0   # 禁用 Paged Attention（测试基线性能）
 
 # 标准测试参数（经过 M4 Pro 优化验证）
 # -t 4: M4 Pro 最优 CPU 线程数（避免 GPU 带宽竞争）
@@ -44,6 +45,7 @@ print_config() {
     echo "环境变量:"
     echo "  METAL_FUSION=$METAL_FUSION"
     echo "  FUSED_QKV=$FUSED_QKV"
+    echo "  THUNDER_MOE_THRESHOLD=$THUNDER_MOE_THRESHOLD"
     echo "  USE_MPS_GRAPH=$USE_MPS_GRAPH"
     echo "  THUNDER_LMCACHE=$THUNDER_LMCACHE"
     echo "  LLAMA_PAGED_ATTENTION=$LLAMA_PAGED_ATTENTION"
